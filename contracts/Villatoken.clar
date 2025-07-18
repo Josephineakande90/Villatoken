@@ -12,6 +12,14 @@
 (define-constant err-marketplace-disabled (err u108))
 (define-constant err-invalid-price (err u109))
 (define-constant err-item-already-listed (err u110))
+(define-constant err-escrow-not-found (err u111))
+(define-constant err-escrow-already-exists (err u112))
+(define-constant err-invalid-escrow-status (err u113))
+(define-constant err-not-escrow-participant (err u114))
+(define-constant err-escrow-expired (err u115))
+(define-constant err-escrow-not-expired (err u116))
+(define-constant err-dispute-timeout (err u117))
+(define-constant err-already-confirmed (err u118))
 
 (define-data-var token-name (string-ascii 32) "Villatoken")
 (define-data-var token-symbol (string-ascii 10) "VILLA")
@@ -20,6 +28,8 @@
 (define-data-var marketplace-enabled bool true)
 (define-data-var marketplace-fee-rate uint u250)
 (define-data-var next-item-id uint u1)
+(define-data-var next-escrow-id uint u1)
+(define-data-var escrow-timeout-blocks uint u1440)
 
 (define-map token-balances principal uint)
 (define-map allowed-minters principal bool)
@@ -44,6 +54,19 @@
     total-purchases: uint,
     rating: uint
 })
+(define-map escrow-agreements uint {
+    buyer: principal,
+    seller: principal,
+    item-id: uint,
+    amount: uint,
+    status: (string-ascii 20),
+    created-at: uint,
+    expires-at: uint,
+    buyer-confirmed: bool,
+    seller-confirmed: bool,
+    disputed: bool
+})
+(define-map user-escrows principal (list 50 uint))
 
 (define-read-only (get-name)
     (ok (var-get token-name))
@@ -91,6 +114,18 @@
 
 (define-read-only (get-next-item-id)
     (var-get next-item-id)
+)
+
+(define-read-only (get-escrow-details (escrow-id uint))
+    (map-get? escrow-agreements escrow-id)
+)
+
+(define-read-only (get-user-escrows (user principal))
+    (default-to (list) (map-get? user-escrows user))
+)
+
+(define-read-only (get-escrow-timeout-blocks)
+    (var-get escrow-timeout-blocks)
 )
 
 (define-public (transfer (amount uint) (from principal) (to principal) (memo (optional (buff 34))))
@@ -268,6 +303,177 @@
                 rating: (get rating current-rep)
             })
         )
+    )
+)
+
+(define-public (create-escrow (item-id uint))
+    (let (
+        (item (unwrap! (map-get? marketplace-items item-id) err-item-not-found))
+        (seller (get seller item))
+        (price (get price item))
+        (escrow-id (var-get next-escrow-id))
+        (expires-at (+ stacks-block-height (var-get escrow-timeout-blocks)))
+    )
+        (asserts! (var-get marketplace-enabled) err-marketplace-disabled)
+        (asserts! (get is-active item) err-item-not-for-sale)
+        (asserts! (not (is-eq tx-sender seller)) err-self-transfer)
+        (asserts! (>= (get-balance-uint tx-sender) price) err-insufficient-payment)
+        (asserts! (is-none (map-get? escrow-agreements escrow-id)) err-escrow-already-exists)
+        
+        (unwrap! (update-balance tx-sender (- (get-balance-uint tx-sender) price))
+            err-insufficient-balance)
+        
+        (map-set escrow-agreements escrow-id {
+            buyer: tx-sender,
+            seller: seller,
+            item-id: item-id,
+            amount: price,
+            status: "active",
+            created-at: stacks-block-height,
+            expires-at: expires-at,
+            buyer-confirmed: false,
+            seller-confirmed: false,
+            disputed: false
+        })
+        
+        (map-set user-escrows tx-sender (unwrap-panic (as-max-len? (append (get-user-escrows tx-sender) escrow-id) u50)))
+        (map-set user-escrows seller (unwrap-panic (as-max-len? (append (get-user-escrows seller) escrow-id) u50)))
+        (map-set marketplace-items item-id (merge item {is-active: false}))
+        
+        (var-set next-escrow-id (+ escrow-id u1))
+        (print {type: "escrow-created", escrow-id: escrow-id, buyer: tx-sender, seller: seller, amount: price})
+        (ok escrow-id)
+    )
+)
+
+(define-public (confirm-delivery (escrow-id uint))
+    (let ((escrow (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found)))
+        (asserts! (is-eq tx-sender (get buyer escrow)) err-not-escrow-participant)
+        (asserts! (is-eq (get status escrow) "active") err-invalid-escrow-status)
+        (asserts! (not (get buyer-confirmed escrow)) err-already-confirmed)
+        (asserts! (<= stacks-block-height (get expires-at escrow)) err-escrow-expired)
+        
+        (let ((updated-escrow (merge escrow {buyer-confirmed: true})))
+            (map-set escrow-agreements escrow-id updated-escrow)
+            (if (get seller-confirmed updated-escrow)
+                (try! (complete-escrow-transaction escrow-id))
+                true
+            )
+        )
+        (print {type: "delivery-confirmed", escrow-id: escrow-id, buyer: tx-sender})
+        (ok true)
+    )
+)
+
+(define-public (confirm-receipt (escrow-id uint))
+    (let ((escrow (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found)))
+        (asserts! (is-eq tx-sender (get seller escrow)) err-not-escrow-participant)
+        (asserts! (is-eq (get status escrow) "active") err-invalid-escrow-status)
+        (asserts! (not (get seller-confirmed escrow)) err-already-confirmed)
+        (asserts! (<= stacks-block-height (get expires-at escrow)) err-escrow-expired)
+        
+        (let ((updated-escrow (merge escrow {seller-confirmed: true})))
+            (map-set escrow-agreements escrow-id updated-escrow)
+            (if (get buyer-confirmed updated-escrow)
+                (try! (complete-escrow-transaction escrow-id))
+                true
+            )
+        )
+        (print {type: "receipt-confirmed", escrow-id: escrow-id, seller: tx-sender})
+        (ok true)
+    )
+)
+
+(define-public (dispute-escrow (escrow-id uint))
+    (let ((escrow (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found)))
+        (asserts! (or (is-eq tx-sender (get buyer escrow)) (is-eq tx-sender (get seller escrow))) err-not-escrow-participant)
+        (asserts! (is-eq (get status escrow) "active") err-invalid-escrow-status)
+        (asserts! (<= stacks-block-height (get expires-at escrow)) err-escrow-expired)
+        
+        (map-set escrow-agreements escrow-id (merge escrow {disputed: true, status: "disputed"}))
+        (print {type: "escrow-disputed", escrow-id: escrow-id, disputer: tx-sender})
+        (ok true)
+    )
+)
+
+(define-public (resolve-dispute (escrow-id uint) (award-to-buyer bool))
+    (let ((escrow (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found)))
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (get disputed escrow) err-invalid-escrow-status)
+        (asserts! (is-eq (get status escrow) "disputed") err-invalid-escrow-status)
+        
+        (if award-to-buyer
+            (begin
+                (unwrap! (update-balance (get buyer escrow) (+ (get-balance-uint (get buyer escrow)) (get amount escrow)))
+                    err-insufficient-balance)
+                (map-set escrow-agreements escrow-id (merge escrow {status: "refunded"}))
+                (print {type: "dispute-resolved", escrow-id: escrow-id, awarded-to: "buyer"})
+            )
+            (begin
+                (try! (complete-escrow-transaction escrow-id))
+                (print {type: "dispute-resolved", escrow-id: escrow-id, awarded-to: "seller"})
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (cancel-expired-escrow (escrow-id uint))
+    (let ((escrow (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found)))
+        (asserts! (> stacks-block-height (get expires-at escrow)) err-escrow-not-expired)
+        (asserts! (is-eq (get status escrow) "active") err-invalid-escrow-status)
+        (asserts! (not (get disputed escrow)) err-invalid-escrow-status)
+        
+        (unwrap! (update-balance (get buyer escrow) (+ (get-balance-uint (get buyer escrow)) (get amount escrow)))
+            err-insufficient-balance)
+        
+        (let ((item-id (get item-id escrow)))
+            (let ((item (unwrap! (map-get? marketplace-items item-id) err-item-not-found)))
+                (map-set marketplace-items item-id (merge item {is-active: true}))
+            )
+        )
+        
+        (map-set escrow-agreements escrow-id (merge escrow {status: "expired"}))
+        (print {type: "escrow-expired", escrow-id: escrow-id, refunded-to: (get buyer escrow)})
+        (ok true)
+    )
+)
+
+(define-public (set-escrow-timeout (new-timeout uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (> new-timeout u0) err-invalid-amount)
+        (var-set escrow-timeout-blocks new-timeout)
+        (ok true)
+    )
+)
+
+(define-private (complete-escrow-transaction (escrow-id uint))
+    (let (
+        (escrow (unwrap! (map-get? escrow-agreements escrow-id) err-escrow-not-found))
+        (seller (get seller escrow))
+        (amount (get amount escrow))
+        (marketplace-fee (/ (* amount (var-get marketplace-fee-rate)) u10000))
+        (seller-amount (- amount marketplace-fee))
+    )
+        (unwrap! (update-balance seller (+ (get-balance-uint seller) seller-amount))
+            err-insufficient-balance)
+        (unwrap! (update-balance contract-owner (+ (get-balance-uint contract-owner) marketplace-fee))
+            err-insufficient-balance)
+        
+        (map-set escrow-agreements escrow-id (merge escrow {status: "completed"}))
+        (map-set item-sales (get item-id escrow) {
+            buyer: (get buyer escrow),
+            seller: seller,
+            price: amount,
+            timestamp: stacks-block-height
+        })
+        
+        (update-user-reputation seller true)
+        (update-user-reputation (get buyer escrow) false)
+        
+        (print {type: "escrow-completed", escrow-id: escrow-id, seller: seller, amount: seller-amount})
+        (ok true)
     )
 )
 
